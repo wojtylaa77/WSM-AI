@@ -1,0 +1,5 @@
+//@version=6
+indicator("WSM-AI Market Structure", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// Market structure module scaffold.
+// Trading logic will be added in a future development phase.
