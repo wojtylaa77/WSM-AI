@@ -1,0 +1,165 @@
+//@version=6
+library("OrderBlockEngine", overlay=true)
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const string OB_NONE = "None"
+const string OB_BULLISH = "Bullish Order Block"
+const string OB_BEARISH = "Bearish Order Block"
+
+// ============================================================================
+// Types
+// ============================================================================
+
+// Stores one order block zone, its lifecycle state, confidence, and persistent box ID.
+export type OrderBlock
+    string blockType
+    float top
+    float bottom
+    int originBar
+    int mitigationBar
+    float confidence
+    bool active
+    bool mitigated
+    bool invalidated
+    bool retested
+    bool breaker
+    box zoneBox
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+// Creates an empty inactive order block used when no valid block is detected.
+newEmptyOrderBlock() =>
+    OrderBlock.new(OB_NONE, na, na, na, na, 0.0, false, false, false, false, false, na)
+
+// Creates a valid active order block with a normalized top and bottom.
+newOrderBlock(string blockType, float zoneTop, float zoneBottom, int originBar) =>
+    float normalizedTop = math.max(zoneTop, zoneBottom)
+    float normalizedBottom = math.min(zoneTop, zoneBottom)
+    OrderBlock.new(blockType, normalizedTop, normalizedBottom, originBar, na, 0.0, true, false, false, false, false, na)
+
+// Returns true when the supplied order block contains a valid active zone definition.
+hasValidZone(OrderBlock orderBlock) =>
+    orderBlock.blockType != OB_NONE and not na(orderBlock.top) and not na(orderBlock.bottom) and not na(orderBlock.originBar)
+
+// Returns true when the supplied order block is bullish.
+isBullishOrderBlock(OrderBlock orderBlock) =>
+    orderBlock.blockType == OB_BULLISH
+
+// Returns true when the supplied order block is bearish.
+isBearishOrderBlock(OrderBlock orderBlock) =>
+    orderBlock.blockType == OB_BEARISH
+
+// Returns the order block height, protected against zero-width zones.
+getBlockRange(OrderBlock orderBlock) =>
+    math.max(math.abs(orderBlock.top - orderBlock.bottom), syminfo.mintick)
+
+// Returns true when the origin bar has aged beyond the configured expiry window.
+isExpired(OrderBlock orderBlock, int expiryBars) =>
+    hasValidZone(orderBlock) and expiryBars > 0 and bar_index - orderBlock.originBar > expiryBars
+
+// ============================================================================
+// Detection
+// ============================================================================
+
+// Detects the last bearish candle before a confirmed bullish BOS and returns a bullish order block.
+export detectBullOrderBlock(bool bullishBOS, int searchLookback) =>
+    OrderBlock detectedBlock = newEmptyOrderBlock()
+    bool foundOrigin = false
+    int normalizedLookback = math.max(searchLookback, 1)
+    if bullishBOS and barstate.isconfirmed
+        for offset = 1 to normalizedLookback
+            if not foundOrigin and close[offset] < open[offset]
+                detectedBlock := newOrderBlock(OB_BULLISH, high[offset], low[offset], bar_index - offset)
+                foundOrigin := true
+    detectedBlock
+
+// Detects the last bullish candle before a confirmed bearish BOS and returns a bearish order block.
+export detectBearOrderBlock(bool bearishBOS, int searchLookback) =>
+    OrderBlock detectedBlock = newEmptyOrderBlock()
+    bool foundOrigin = false
+    int normalizedLookback = math.max(searchLookback, 1)
+    if bearishBOS and barstate.isconfirmed
+        for offset = 1 to normalizedLookback
+            if not foundOrigin and close[offset] > open[offset]
+                detectedBlock := newOrderBlock(OB_BEARISH, high[offset], low[offset], bar_index - offset)
+                foundOrigin := true
+    detectedBlock
+
+// ============================================================================
+// State Logic
+// ============================================================================
+
+// Returns true when price first trades back into an active order block zone after origin creation.
+export isMitigated(OrderBlock orderBlock) =>
+    hasValidZone(orderBlock) and orderBlock.active and bar_index > orderBlock.originBar and high >= orderBlock.bottom and low <= orderBlock.top
+
+// Returns true when price revisits a mitigated order block after its first mitigation bar.
+export isRetested(OrderBlock orderBlock) =>
+    hasValidZone(orderBlock) and orderBlock.active and orderBlock.mitigated and not orderBlock.invalidated and not na(orderBlock.mitigationBar) and bar_index > orderBlock.mitigationBar and high >= orderBlock.bottom and low <= orderBlock.top
+
+// Returns true when price closes through the far side of an order block and invalidates the zone.
+export isInvalidated(OrderBlock orderBlock) =>
+    hasValidZone(orderBlock) and ((isBullishOrderBlock(orderBlock) and close < orderBlock.bottom) or (isBearishOrderBlock(orderBlock) and close > orderBlock.top))
+
+// Calculates a deterministic 0-100 confidence score from zone size, lifecycle state, and ATR context.
+export calculateConfidence(OrderBlock orderBlock, float atrValue) =>
+    float score = 0.0
+    if hasValidZone(orderBlock)
+        float rangeToAtr = atrValue > 0.0 ? getBlockRange(orderBlock) / atrValue : 1.0
+        float sizeScore = math.min(rangeToAtr, 2.0) / 2.0 * 35.0
+        float stateScore = orderBlock.active ? 35.0 : 0.0
+        float mitigationScore = orderBlock.mitigated ? 15.0 : 5.0
+        float retestScore = orderBlock.retested ? 10.0 : 0.0
+        float penalty = orderBlock.invalidated ? 60.0 : orderBlock.breaker ? 25.0 : 0.0
+        score := sizeScore + stateScore + mitigationScore + retestScore - penalty
+    math.max(0.0, math.min(100.0, score))
+
+// ============================================================================
+// Rendering
+// ============================================================================
+
+// Draws a new order block box once, then extends and updates the same persistent box on later bars.
+export drawOrderBlock(OrderBlock orderBlock, color bullishColor, color bearishColor, color inactiveColor, bool showBlocks) =>
+    OrderBlock renderedBlock = orderBlock
+    if hasValidZone(renderedBlock)
+        color activeColor = isBullishOrderBlock(renderedBlock) ? bullishColor : bearishColor
+        color zoneColor = renderedBlock.active and showBlocks ? activeColor : inactiveColor
+        color borderColor = renderedBlock.invalidated ? inactiveColor : activeColor
+        if na(renderedBlock.zoneBox)
+            renderedBlock.zoneBox := box.new(renderedBlock.originBar, renderedBlock.top, bar_index, renderedBlock.bottom, xloc=xloc.bar_index, bgcolor=zoneColor, border_color=borderColor)
+        else
+            box.set_left(renderedBlock.zoneBox, renderedBlock.originBar)
+            box.set_right(renderedBlock.zoneBox, bar_index)
+            box.set_top(renderedBlock.zoneBox, renderedBlock.top)
+            box.set_bottom(renderedBlock.zoneBox, renderedBlock.bottom)
+            box.set_bgcolor(renderedBlock.zoneBox, zoneColor)
+            box.set_border_color(renderedBlock.zoneBox, borderColor)
+    renderedBlock
+
+// ============================================================================
+// State Updates
+// ============================================================================
+
+// Updates mitigation, retest, invalidation, breaker, expiry, confidence, and persistent drawing state.
+export updateOrderBlockState(OrderBlock orderBlock, int expiryBars, float atrValue, color bullishColor, color bearishColor, color inactiveColor, bool showBlocks) =>
+    OrderBlock updatedBlock = orderBlock
+    if hasValidZone(updatedBlock)
+        bool mitigatedNow = isMitigated(updatedBlock)
+        bool retestedNow = isRetested(updatedBlock)
+        bool invalidatedNow = isInvalidated(updatedBlock)
+        bool expiredNow = isExpired(updatedBlock, expiryBars)
+
+        updatedBlock.mitigationBar := mitigatedNow and na(updatedBlock.mitigationBar) ? bar_index : updatedBlock.mitigationBar
+        updatedBlock.mitigated := updatedBlock.mitigated or mitigatedNow
+        updatedBlock.retested := updatedBlock.retested or retestedNow
+        updatedBlock.invalidated := updatedBlock.invalidated or invalidatedNow
+        updatedBlock.breaker := updatedBlock.breaker or invalidatedNow
+        updatedBlock.active := not updatedBlock.invalidated and not expiredNow
+        updatedBlock.confidence := calculateConfidence(updatedBlock, atrValue)
+        updatedBlock := drawOrderBlock(updatedBlock, bullishColor, bearishColor, inactiveColor, showBlocks)
+    updatedBlock

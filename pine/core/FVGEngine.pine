@@ -1,0 +1,161 @@
+//@version=6
+library("WSM_AI_FVGEngine", overlay=true)
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const string FVG_NONE = "None"
+const string FVG_BULLISH = "Bullish FVG"
+const string FVG_BEARISH = "Bearish FVG"
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export type FVG
+    string fvgType
+    float top
+    float bottom
+    int creationBar
+    int mitigationBar
+    float fillPercentage
+    float confidence
+    bool active
+    bool invalidated
+    bool mitigated
+    bool retested
+    bool expired
+    box zoneBox
+
+// ============================================================================
+// Event Helpers
+// ============================================================================
+
+// Creates a standardized FVG object for downstream modules and future scoring.
+export newFVG(string fvgType, float top, float bottom, int creationBar) =>
+    FVG.new(fvgType, top, bottom, creationBar, na, 0.0, 0.0, true, false, false, false, false, na)
+
+// Creates an empty FVG object for bars where no new fair value gap is detected.
+export noFVG() =>
+    FVG.new(FVG_NONE, na, na, na, na, 0.0, 0.0, false, false, false, false, false, na)
+
+// Returns true when an FVG object represents a real detected fair value gap.
+export hasFVG(FVG fvg) =>
+    fvg.fvgType != FVG_NONE and not na(fvg.top) and not na(fvg.bottom) and not na(fvg.creationBar)
+
+// Returns true when an FVG is bullish.
+isBullishFVG(FVG fvg) =>
+    fvg.fvgType == FVG_BULLISH
+
+// Returns true when an FVG is bearish.
+isBearishFVG(FVG fvg) =>
+    fvg.fvgType == FVG_BEARISH
+
+// Returns the normalized height of an FVG zone.
+getFVGRange(FVG fvg) =>
+    math.max(math.abs(fvg.top - fvg.bottom), syminfo.mintick)
+
+// Clamps a confidence value into the 0-100 scoring range.
+clampConfidence(float value) =>
+    math.max(0.0, math.min(100.0, value))
+
+// ============================================================================
+// Detection
+// ============================================================================
+
+// Detects a non-repainting bullish fair value gap after the third candle closes.
+export detectBullFVG(series float highSource, series float lowSource) =>
+    bool detected = barstate.isconfirmed and bar_index >= 2 and lowSource > highSource[2]
+    detected ? newFVG(FVG_BULLISH, lowSource, highSource[2], bar_index) : noFVG()
+
+// Detects a non-repainting bearish fair value gap after the third candle closes.
+export detectBearFVG(series float highSource, series float lowSource) =>
+    bool detected = barstate.isconfirmed and bar_index >= 2 and highSource < lowSource[2]
+    detected ? newFVG(FVG_BEARISH, lowSource[2], highSource, bar_index) : noFVG()
+
+// ============================================================================
+// State Calculation
+// ============================================================================
+
+// Calculates the current fill percentage of an FVG using directional wick penetration into the zone.
+export calculateFillPercentage(FVG fvg, series float highSource, series float lowSource) =>
+    if not hasFVG(fvg)
+        0.0
+    else
+        float zoneRange = getFVGRange(fvg)
+        float rawFill = 0.0
+        if isBullishFVG(fvg)
+            rawFill := lowSource > fvg.top ? 0.0 : lowSource <= fvg.bottom ? 100.0 : ((fvg.top - lowSource) / zoneRange) * 100.0
+        if isBearishFVG(fvg)
+            rawFill := highSource < fvg.bottom ? 0.0 : highSource >= fvg.top ? 100.0 : ((highSource - fvg.bottom) / zoneRange) * 100.0
+        math.max(0.0, math.min(100.0, rawFill))
+
+// Calculates a normalized FVG confidence score for future AI scoring workflows.
+export calculateFVGConfidence(FVG fvg, float atrValue) =>
+    if not hasFVG(fvg) or fvg.invalidated
+        0.0
+    else
+        float safeAtr = math.max(atrValue, syminfo.mintick)
+        float sizeRatio = getFVGRange(fvg) / safeAtr
+        float sizeScore = math.min(40.0, sizeRatio * 40.0)
+        float activeScore = fvg.active ? 25.0 : 5.0
+        float fillScore = math.max(0.0, 35.0 * (1.0 - fvg.fillPercentage * 0.01))
+        float expiryPenalty = fvg.expired ? 30.0 : 0.0
+        clampConfidence(sizeScore + activeScore + fillScore - expiryPenalty)
+
+// Returns true when price has entered an active FVG zone.
+export isMitigated(FVG fvg, series float highSource, series float lowSource) =>
+    hasFVG(fvg) and fvg.active and bar_index > fvg.creationBar and highSource >= fvg.bottom and lowSource <= fvg.top
+
+// Returns true when price retests an already mitigated FVG before invalidation or expiry.
+export isRetested(FVG fvg, series float highSource, series float lowSource) =>
+    hasFVG(fvg) and fvg.active and fvg.mitigated and not fvg.invalidated and bar_index > nz(fvg.mitigationBar, fvg.creationBar) and highSource >= fvg.bottom and lowSource <= fvg.top
+
+// Returns true when an FVG has been fully filled by price.
+isInvalidated(FVG fvg, series float highSource, series float lowSource) =>
+    hasFVG(fvg) and ((isBullishFVG(fvg) and lowSource <= fvg.bottom) or (isBearishFVG(fvg) and highSource >= fvg.top))
+
+// Returns true when an active FVG has aged beyond the configured maximum bars.
+isExpired(FVG fvg, int maxAgeBars) =>
+    hasFVG(fvg) and maxAgeBars > 0 and bar_index - fvg.creationBar > maxAgeBars
+
+// Updates mitigation, retest, fill, invalidation, active, and expiry state for an FVG.
+export updateFVGState(FVG fvg, series float highSource, series float lowSource, int maxAgeBars) =>
+    FVG updated = fvg
+    if hasFVG(updated)
+        float currentFill = calculateFillPercentage(updated, highSource, lowSource)
+        bool mitigatedNow = isMitigated(updated, highSource, lowSource)
+        bool retestedNow = isRetested(updated, highSource, lowSource)
+        bool invalidatedNow = isInvalidated(updated, highSource, lowSource)
+        bool expiredNow = isExpired(updated, maxAgeBars)
+
+        updated.fillPercentage := math.max(updated.fillPercentage, currentFill)
+        updated.mitigationBar := mitigatedNow and na(updated.mitigationBar) ? bar_index : updated.mitigationBar
+        updated.mitigated := updated.mitigated or mitigatedNow
+        updated.retested := updated.retested or retestedNow
+        updated.invalidated := updated.invalidated or invalidatedNow
+        updated.expired := updated.expired or expiredNow
+        updated.active := not updated.invalidated and not updated.expired
+    updated
+
+// ============================================================================
+// Drawing
+// ============================================================================
+
+// Draws or extends an FVG zone box and returns the updated FVG object with its box reference.
+export drawFVG(FVG fvg, color bullishColor, color bearishColor, int transparency) =>
+    FVG updated = fvg
+    if hasFVG(updated)
+        color zoneColor = isBullishFVG(updated) ? bullishColor : bearishColor
+        color bgColor = color.new(zoneColor, transparency)
+        color borderColor = color.new(zoneColor, math.min(transparency, 85))
+        if na(updated.zoneBox)
+            updated.zoneBox := box.new(updated.creationBar, updated.top, bar_index, updated.bottom, xloc=xloc.bar_index, bgcolor=bgColor, border_color=borderColor)
+        else
+            box.set_right(updated.zoneBox, bar_index)
+            box.set_top(updated.zoneBox, updated.top)
+            box.set_bottom(updated.zoneBox, updated.bottom)
+            box.set_bgcolor(updated.zoneBox, bgColor)
+            box.set_border_color(updated.zoneBox, borderColor)
+    updated

@@ -1,5 +1,224 @@
 //@version=6
 indicator("WSM-AI Market Structure", overlay=true, max_labels_count=500, max_lines_count=500)
 
-// Market structure module scaffold.
-// Trading logic will be added in a future development phase.
+// ============================================================================
+// Inputs
+// ============================================================================
+
+int swingLength = input.int(5, "Swing Length", minval=1)
+bool showSwings = input.bool(true, "Show Swing Labels")
+bool showStructureBreaks = input.bool(true, "Show BOS / CHOCH")
+bool showStatusPanel = input.bool(true, "Show Status Panel")
+color bullishColor = input.color(color.lime, "Bullish Color")
+color bearishColor = input.color(color.red, "Bearish Color")
+color neutralColor = input.color(color.gray, "Neutral Color")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const int TREND_BULLISH = 1
+const int TREND_BEARISH = -1
+const int TREND_NEUTRAL = 0
+
+const string STRUCTURE_SH = "SH"
+const string STRUCTURE_SL = "SL"
+const string STRUCTURE_HH = "HH"
+const string STRUCTURE_HL = "HL"
+const string STRUCTURE_LH = "LH"
+const string STRUCTURE_LL = "LL"
+
+const string EVENT_NONE = "None"
+const string EVENT_BOS = "BOS"
+const string EVENT_CHOCH = "CHOCH"
+
+// ============================================================================
+// State
+// ============================================================================
+
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var string lastSwingHighType = ""
+
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+var string lastSwingLowType = ""
+
+var float protectedHigh = na
+var int protectedHighBar = na
+var float protectedLow = na
+var int protectedLowBar = na
+
+var int lastBrokenHighBar = na
+var int lastBrokenLowBar = na
+var int marketTrend = TREND_NEUTRAL
+var string lastEvent = EVENT_NONE
+var float lastEventPrice = na
+
+var table statusPanel = table.new(position.top_right, 2, 5, border_width=1)
+
+// Returns true when a confirmed pivot high exists on the current bar.
+hasSwingHigh(int length) =>
+    not na(ta.pivothigh(high, length, length))
+
+// Returns true when a confirmed pivot low exists on the current bar.
+hasSwingLow(int length) =>
+    not na(ta.pivotlow(low, length, length))
+
+// Returns the price of the confirmed pivot high for the configured lookback.
+getSwingHighPrice(int length) =>
+    ta.pivothigh(high, length, length)
+
+// Returns the price of the confirmed pivot low for the configured lookback.
+getSwingLowPrice(int length) =>
+    ta.pivotlow(low, length, length)
+
+// Returns the bar index where the confirmed pivot occurred.
+getSwingBar(int length) =>
+    bar_index - length
+
+// Classifies a new swing high as SH, HH, or LH using the previous confirmed swing high.
+classifySwingHigh(float swingPrice, float previousSwingHigh) =>
+    na(previousSwingHigh) ? STRUCTURE_SH : swingPrice > previousSwingHigh ? STRUCTURE_HH : STRUCTURE_LH
+
+// Classifies a new swing low as SL, HL, or LL using the previous confirmed swing low.
+classifySwingLow(float swingPrice, float previousSwingLow) =>
+    na(previousSwingLow) ? STRUCTURE_SL : swingPrice > previousSwingLow ? STRUCTURE_HL : STRUCTURE_LL
+
+// Returns the display color associated with a swing classification.
+getSwingColor(string swingType) =>
+    swingType == STRUCTURE_HH or swingType == STRUCTURE_HL ? bullishColor : swingType == STRUCTURE_LH or swingType == STRUCTURE_LL ? bearishColor : neutralColor
+
+// Returns a readable trend name for the status panel.
+getTrendText(int trend) =>
+    trend == TREND_BULLISH ? "Bullish" : trend == TREND_BEARISH ? "Bearish" : "Neutral"
+
+// Returns the display color associated with the current trend.
+getTrendColor(int trend) =>
+    trend == TREND_BULLISH ? bullishColor : trend == TREND_BEARISH ? bearishColor : neutralColor
+
+// Infers structural trend from the latest swing sequence while preserving trend when structure is incomplete.
+deriveStructuralTrend(string swingHighType, string swingLowType, int currentTrend) =>
+    swingHighType == STRUCTURE_HH and swingLowType == STRUCTURE_HL ? TREND_BULLISH : swingHighType == STRUCTURE_LH and swingLowType == STRUCTURE_LL ? TREND_BEARISH : currentTrend
+
+// Formats a price for labels and panel values while protecting against empty values.
+formatPrice(float price) =>
+    na(price) ? "-" : str.tostring(price, format.mintick)
+
+// Formats a swing type and price as one compact panel value.
+formatSwingValue(string swingType, float swingPrice) =>
+    swingType == "" or na(swingPrice) ? "-" : swingType + " @ " + formatPrice(swingPrice)
+
+// Formats the latest structural event for the status panel.
+formatEventValue(string eventType, float eventPrice) =>
+    eventType == EVENT_NONE or na(eventPrice) ? EVENT_NONE : eventType + " @ " + formatPrice(eventPrice)
+
+// Draws a compact swing label at the confirmed pivot bar.
+drawSwingLabel(int pivotBar, float pivotPrice, string swingType, bool isHigh) =>
+    if showSwings
+        labelStyle = isHigh ? label.style_label_down : label.style_label_up
+        label.new(pivotBar, pivotPrice, swingType, xloc=xloc.bar_index, style=labelStyle, color=getSwingColor(swingType), textcolor=color.white, size=size.tiny)
+
+// Draws a horizontal structure-break line between the protected swing and break bar.
+drawStructureLine(int startBar, float level, string eventType, bool isBullish) =>
+    if showStructureBreaks and not na(startBar) and not na(level)
+        breakColor = isBullish ? bullishColor : bearishColor
+        line.new(startBar, level, bar_index, level, xloc=xloc.bar_index, extend=extend.none, color=breakColor, style=line.style_solid, width=1)
+        labelStyle = isBullish ? label.style_label_up : label.style_label_down
+        label.new(bar_index, level, eventType, xloc=xloc.bar_index, style=labelStyle, color=breakColor, textcolor=color.white, size=size.small)
+
+// Returns true when price closes above an unbroken protected high.
+isBullishBreak(float level, int levelBar, int brokenBar) =>
+    not na(level) and not na(levelBar) and levelBar != brokenBar and close > level
+
+// Returns true when price closes below an unbroken protected low.
+isBearishBreak(float level, int levelBar, int brokenBar) =>
+    not na(level) and not na(levelBar) and levelBar != brokenBar and close < level
+
+// Classifies a bullish break as BOS during bullish or neutral context, and CHOCH during bearish context.
+classifyBullishBreak(int trend) =>
+    trend == TREND_BEARISH ? EVENT_CHOCH : EVENT_BOS
+
+// Classifies a bearish break as BOS during bearish or neutral context, and CHOCH during bullish context.
+classifyBearishBreak(int trend) =>
+    trend == TREND_BULLISH ? EVENT_CHOCH : EVENT_BOS
+
+// Writes one row to the optional status panel.
+setPanelRow(table panel, int row, string title, string value, color valueColor) =>
+    table.cell(panel, 0, row, title, text_color=color.white, bgcolor=color.black, text_size=size.small)
+    table.cell(panel, 1, row, value, text_color=valueColor, bgcolor=color.black, text_size=size.small)
+
+// Updates or clears the optional status panel on the latest bar.
+updateStatusPanel(table panel, bool isVisible) =>
+    if barstate.islast
+        if isVisible
+            setPanelRow(panel, 0, "Trend", getTrendText(marketTrend), getTrendColor(marketTrend))
+            setPanelRow(panel, 1, "Swing High", formatSwingValue(lastSwingHighType, lastSwingHigh), getSwingColor(lastSwingHighType))
+            setPanelRow(panel, 2, "Swing Low", formatSwingValue(lastSwingLowType, lastSwingLow), getSwingColor(lastSwingLowType))
+            setPanelRow(panel, 3, "Last Event", formatEventValue(lastEvent, lastEventPrice), lastEvent == EVENT_NONE ? neutralColor : getTrendColor(marketTrend))
+            setPanelRow(panel, 4, "Engine", "Market Structure", neutralColor)
+        else
+            table.clear(panel, 0, 0, 1, 4)
+
+// ============================================================================
+// Structure Break Detection
+// ============================================================================
+
+bool bullishBreak = isBullishBreak(protectedHigh, protectedHighBar, lastBrokenHighBar)
+bool bearishBreak = not bullishBreak and isBearishBreak(protectedLow, protectedLowBar, lastBrokenLowBar)
+
+if bullishBreak
+    string bullishEvent = classifyBullishBreak(marketTrend)
+    drawStructureLine(protectedHighBar, protectedHigh, bullishEvent, true)
+    marketTrend := TREND_BULLISH
+    lastEvent := bullishEvent
+    lastEventPrice := protectedHigh
+    lastBrokenHighBar := protectedHighBar
+    protectedHigh := na
+    protectedHighBar := na
+else if bearishBreak
+    string bearishEvent = classifyBearishBreak(marketTrend)
+    drawStructureLine(protectedLowBar, protectedLow, bearishEvent, false)
+    marketTrend := TREND_BEARISH
+    lastEvent := bearishEvent
+    lastEventPrice := protectedLow
+    lastBrokenLowBar := protectedLowBar
+    protectedLow := na
+    protectedLowBar := na
+
+// ============================================================================
+// Swing Detection
+// ============================================================================
+
+bool newSwingHigh = hasSwingHigh(swingLength)
+bool newSwingLow = hasSwingLow(swingLength)
+
+if newSwingHigh
+    float swingHighPrice = getSwingHighPrice(swingLength)
+    int swingHighBar = getSwingBar(swingLength)
+    string swingHighType = classifySwingHigh(swingHighPrice, lastSwingHigh)
+
+    drawSwingLabel(swingHighBar, swingHighPrice, swingHighType, true)
+
+    lastSwingHigh := swingHighPrice
+    lastSwingHighBar := swingHighBar
+    lastSwingHighType := swingHighType
+    protectedHigh := swingHighPrice
+    protectedHighBar := swingHighBar
+
+if newSwingLow
+    float swingLowPrice = getSwingLowPrice(swingLength)
+    int swingLowBar = getSwingBar(swingLength)
+    string swingLowType = classifySwingLow(swingLowPrice, lastSwingLow)
+
+    drawSwingLabel(swingLowBar, swingLowPrice, swingLowType, false)
+
+    lastSwingLow := swingLowPrice
+    lastSwingLowBar := swingLowBar
+    lastSwingLowType := swingLowType
+    protectedLow := swingLowPrice
+    protectedLowBar := swingLowBar
+
+marketTrend := deriveStructuralTrend(lastSwingHighType, lastSwingLowType, marketTrend)
+
+updateStatusPanel(statusPanel, showStatusPanel)

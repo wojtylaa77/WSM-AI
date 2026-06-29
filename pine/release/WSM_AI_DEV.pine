@@ -1,0 +1,804 @@
+//@version=6
+indicator("WSM-AI DEV", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ============================================================================
+// Inputs
+// ============================================================================
+
+int swingLength = input.int(5, "Market Structure Swing Length", minval=1)
+int liquidityLookback = input.int(5, "Liquidity Lookback", minval=1)
+float liquidityTolerancePercent = input.float(0.05, "Liquidity Tolerance %", minval=0.0, step=0.01)
+int liquidityRenderMaxAgeBars = input.int(200, "Liquidity Render Max Age Bars", minval=1)
+int fvgMaxAgeBars = input.int(120, "FVG Max Age Bars", minval=1)
+int maxActiveFVGBoxes = input.int(5, "Max Active FVG Boxes", minval=1)
+int orderBlockLookback = input.int(20, "Order Block Origin Lookback", minval=1)
+int orderBlockMaxAgeBars = input.int(180, "Order Block Max Age Bars", minval=1)
+int atrLength = input.int(14, "ATR Length", minval=1)
+
+bool showMarketStructure = input.bool(true, "Show Market Structure")
+bool showStructureBreaks = input.bool(true, "Show BOS / CHOCH")
+bool showLiquidity = input.bool(true, "Show Liquidity Events")
+bool showFVG = input.bool(true, "Show FVG Boxes")
+bool showOrderBlocks = input.bool(true, "Show Order Block Boxes")
+bool showPanel = input.bool(true, "Show DEV Panel")
+
+color bullishColor = input.color(color.lime, "Bullish Color")
+color bearishColor = input.color(color.red, "Bearish Color")
+color neutralColor = input.color(color.gray, "Neutral Color")
+color fvgBullColor = input.color(color.new(color.green, 82), "Bullish FVG Color")
+color fvgBearColor = input.color(color.new(color.red, 82), "Bearish FVG Color")
+color obBullColor = input.color(color.new(color.teal, 82), "Bullish OB Color")
+color obBearColor = input.color(color.new(color.maroon, 82), "Bearish OB Color")
+color inactiveBoxColor = input.color(color.new(color.gray, 90), "Inactive Box Color")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const int TREND_BULLISH = 1
+const int TREND_BEARISH = -1
+const int TREND_NEUTRAL = 0
+
+const string STRUCTURE_SH = "SH"
+const string STRUCTURE_SL = "SL"
+const string STRUCTURE_HH = "HH"
+const string STRUCTURE_HL = "HL"
+const string STRUCTURE_LH = "LH"
+const string STRUCTURE_LL = "LL"
+
+const string EVENT_NONE = "None"
+const string EVENT_BOS = "BOS"
+const string EVENT_CHOCH = "CHOCH"
+const string EVENT_EQH = "EQH"
+const string EVENT_EQL = "EQL"
+const string EVENT_BSL = "BSL"
+const string EVENT_SSL = "SSL"
+const string EVENT_SWEEP_HIGH = "Sweep High"
+const string EVENT_SWEEP_LOW = "Sweep Low"
+
+const string FVG_NONE = "None"
+const string FVG_BULLISH = "Bullish FVG"
+const string FVG_BEARISH = "Bearish FVG"
+
+const string OB_NONE = "None"
+const string OB_BULLISH = "Bullish Order Block"
+const string OB_BEARISH = "Bearish Order Block"
+
+// ============================================================================
+// Types
+// ============================================================================
+
+type FVG
+    string fvgType
+    float top
+    float bottom
+    int creationBar
+    int mitigationBar
+    float fillPercentage
+    bool active
+    bool invalidated
+    bool mitigated
+    bool retested
+    bool expired
+    box zoneBox
+
+type OrderBlock
+    string blockType
+    float top
+    float bottom
+    int originBar
+    int mitigationBar
+    float confidence
+    bool active
+    bool mitigated
+    bool invalidated
+    bool retested
+    bool breaker
+    bool expired
+    box zoneBox
+
+// ============================================================================
+// State
+// ============================================================================
+
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var string lastSwingHighType = ""
+
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+var string lastSwingLowType = ""
+
+var float protectedHigh = na
+var int protectedHighBar = na
+var float protectedLow = na
+var int protectedLowBar = na
+
+var int lastBrokenHighBar = na
+var int lastBrokenLowBar = na
+var int marketTrend = TREND_NEUTRAL
+var string lastStructureEvent = EVENT_NONE
+var float lastStructurePrice = na
+
+var float lastLiquidityHigh = na
+var int lastLiquidityHighBar = na
+var float lastLiquidityLow = na
+var int lastLiquidityLowBar = na
+var string lastLiquidityEvent = EVENT_NONE
+var float lastLiquidityPrice = na
+
+var array<FVG> fvgs = array.new<FVG>()
+var array<string> fvgRenderKeys = array.new<string>()
+var int lastFVGIndex = na
+
+var array<OrderBlock> orderBlocks = array.new<OrderBlock>()
+var array<string> orderBlockRenderKeys = array.new<string>()
+var int lastOrderBlockIndex = na
+
+var array<string> swingLabelKeys = array.new<string>()
+var array<label> swingLabels = array.new<label>()
+var array<string> structureBreakKeys = array.new<string>()
+var array<line> structureBreakLines = array.new<line>()
+var array<label> structureBreakLabels = array.new<label>()
+var array<line> activeLiquidityLines = array.new<line>(2, na)
+var array<label> activeLiquidityLabels = array.new<label>(2, na)
+var array<label> liquidityEventLabels = array.new<label>(2, na)
+
+var table devPanel = table.new(position.top_right, 2, 5, border_width=1)
+
+// ============================================================================
+// Formatting Helpers
+// ============================================================================
+
+// Returns a readable trend name for the DEV panel.
+getTrendText(int trend) =>
+    trend == TREND_BULLISH ? "Bullish" : trend == TREND_BEARISH ? "Bearish" : "Neutral"
+
+// Returns the display color associated with the current trend.
+getTrendColor(int trend) =>
+    trend == TREND_BULLISH ? bullishColor : trend == TREND_BEARISH ? bearishColor : neutralColor
+
+// Formats a price using the symbol's minimum tick.
+formatPrice(float price) =>
+    na(price) ? "-" : str.tostring(price, format.mintick)
+
+// Formats an event and price for compact panel display.
+formatEventPrice(string eventType, float eventPrice) =>
+    eventType + " @ " + formatPrice(eventPrice)
+
+// Writes one row to the top-right DEV panel.
+setPanelRow(int row, string title, string value, color valueColor) =>
+    table.cell(devPanel, 0, row, title, text_color=color.white, bgcolor=color.black, text_size=size.small)
+    table.cell(devPanel, 1, row, value, text_color=valueColor, bgcolor=color.black, text_size=size.small)
+
+// ============================================================================
+// Rendering Helpers
+// ============================================================================
+
+// Finds a persistent visual key and returns -1 when the key has not been registered.
+findVisualKeyIndex(array<string> keys, string visualKey) =>
+    int foundIndex = -1
+    if array.size(keys) > 0
+        for index = 0 to array.size(keys) - 1
+            if array.get(keys, index) == visualKey
+                foundIndex := index
+    foundIndex
+
+// Returns a stable key for one visual object at a specific bar and price.
+buildVisualKey(string prefix, int eventBar, float eventPrice, string eventType) =>
+    prefix + "|" + str.tostring(eventBar) + "|" + eventType + "|" + formatPrice(eventPrice)
+
+// Creates a label once, then updates the existing label on future calls with the same key.
+createOrUpdateLabel(label existingLabel, bool visible, int eventBar, float eventPrice, string labelText, bool isHighSide, color labelColor, string labelSize) =>
+    label result = existingLabel
+    labelStyle = isHighSide ? label.style_label_down : label.style_label_up
+    color visibleColor = visible ? labelColor : color.new(labelColor, 100)
+    color textColor = visible ? color.white : color.new(color.white, 100)
+    if na(result)
+        result := label.new(eventBar, eventPrice, labelText, xloc=xloc.bar_index, style=labelStyle, color=visibleColor, textcolor=textColor, size=labelSize)
+    else
+        label.set_x(result, eventBar)
+        label.set_y(result, eventPrice)
+        label.set_text(result, labelText)
+        label.set_style(result, labelStyle)
+        label.set_color(result, visibleColor)
+        label.set_textcolor(result, textColor)
+        label.set_size(result, labelSize)
+    result
+
+// Creates a structure-break line once, then updates the existing line on future calls with the same key.
+createOrUpdateStructureLine(line existingLine, bool visible, int startBar, float level, color breakColor) =>
+    line result = existingLine
+    color lineColor = visible ? breakColor : color.new(breakColor, 100)
+    if na(result)
+        result := line.new(startBar, level, bar_index, level, xloc=xloc.bar_index, extend=extend.none, color=lineColor, width=1)
+    else
+        line.set_x1(result, startBar)
+        line.set_y1(result, level)
+        line.set_x2(result, bar_index)
+        line.set_y2(result, level)
+        line.set_color(result, lineColor)
+        line.set_width(result, 1)
+    result
+
+// Returns a swing label color based on the structure type.
+getSwingColor(string swingType) =>
+    swingType == STRUCTURE_HH or swingType == STRUCTURE_HL ? bullishColor : swingType == STRUCTURE_LH or swingType == STRUCTURE_LL ? bearishColor : neutralColor
+
+// Registers or updates one market-structure swing label without creating duplicates.
+renderSwingLabel(int pivotBar, float pivotPrice, string swingType, bool isHigh) =>
+    string visualKey = buildVisualKey("SWING", pivotBar, pivotPrice, swingType)
+    int existingIndex = findVisualKeyIndex(swingLabelKeys, visualKey)
+    label existingLabel = existingIndex >= 0 ? array.get(swingLabels, existingIndex) : na
+    label updatedLabel = createOrUpdateLabel(existingLabel, showMarketStructure, pivotBar, pivotPrice, swingType, isHigh, getSwingColor(swingType), size.tiny)
+    if existingIndex == -1
+        array.push(swingLabelKeys, visualKey)
+        array.push(swingLabels, updatedLabel)
+    else
+        array.set(swingLabels, existingIndex, updatedLabel)
+
+// Registers or updates one BOS/CHOCH line and label without creating duplicates.
+renderStructureBreak(int startBar, float level, string eventType, bool isBullish) =>
+    if not na(startBar) and not na(level)
+        string visualKey = buildVisualKey("STRUCTURE_BREAK", startBar, level, eventType)
+        int existingIndex = findVisualKeyIndex(structureBreakKeys, visualKey)
+        color breakColor = isBullish ? bullishColor : bearishColor
+        line existingLine = existingIndex >= 0 ? array.get(structureBreakLines, existingIndex) : na
+        label existingLabel = existingIndex >= 0 ? array.get(structureBreakLabels, existingIndex) : na
+        line updatedLine = createOrUpdateStructureLine(existingLine, showStructureBreaks, startBar, level, breakColor)
+        label updatedLabel = createOrUpdateLabel(existingLabel, showStructureBreaks, bar_index, level, eventType, not isBullish, breakColor, size.small)
+        if existingIndex == -1
+            array.push(structureBreakKeys, visualKey)
+            array.push(structureBreakLines, updatedLine)
+            array.push(structureBreakLabels, updatedLabel)
+        else
+            array.set(structureBreakLines, existingIndex, updatedLine)
+            array.set(structureBreakLabels, existingIndex, updatedLabel)
+
+// Registers or updates the latest liquidity event label for one side without keeping historical labels alive.
+renderLiquidityLabel(int eventBar, float eventPrice, string eventType, bool isHighSide) =>
+    int slot = isHighSide ? 0 : 1
+    label existingLabel = array.get(liquidityEventLabels, slot)
+    color eventColor = isHighSide ? bearishColor : bullishColor
+    label updatedLabel = createOrUpdateLabel(existingLabel, showLiquidity, eventBar, eventPrice, eventType, isHighSide, eventColor, size.tiny)
+    array.set(liquidityEventLabels, slot, updatedLabel)
+
+// Creates or updates one active liquidity level line and its label without duplicating drawings.
+renderActiveLiquidityLevel(bool isHighSide, int eventBar, float eventPrice, string eventType) =>
+    int slot = isHighSide ? 0 : 1
+    line existingLine = array.get(activeLiquidityLines, slot)
+    label existingLabel = array.get(activeLiquidityLabels, slot)
+    color levelColor = isHighSide ? bearishColor : bullishColor
+    color lineColor = showLiquidity ? levelColor : color.new(levelColor, 100)
+    color labelColor = showLiquidity ? levelColor : color.new(levelColor, 100)
+    color labelTextColor = showLiquidity ? color.white : color.new(color.white, 100)
+    labelStyle = isHighSide ? label.style_label_down : label.style_label_up
+    if na(existingLine)
+        existingLine := line.new(eventBar, eventPrice, bar_index, eventPrice, xloc=xloc.bar_index, extend=extend.none, color=lineColor, width=1)
+    else
+        line.set_x1(existingLine, eventBar)
+        line.set_y1(existingLine, eventPrice)
+        line.set_x2(existingLine, bar_index)
+        line.set_y2(existingLine, eventPrice)
+        line.set_color(existingLine, lineColor)
+        line.set_width(existingLine, 1)
+    if na(existingLabel)
+        existingLabel := label.new(eventBar, eventPrice, eventType, xloc=xloc.bar_index, style=labelStyle, color=labelColor, textcolor=labelTextColor, size=size.tiny)
+    else
+        label.set_x(existingLabel, eventBar)
+        label.set_y(existingLabel, eventPrice)
+        label.set_text(existingLabel, eventType)
+        label.set_style(existingLabel, labelStyle)
+        label.set_color(existingLabel, labelColor)
+        label.set_textcolor(existingLabel, labelTextColor)
+        label.set_size(existingLabel, size.tiny)
+    array.set(activeLiquidityLines, slot, existingLine)
+    array.set(activeLiquidityLabels, slot, existingLabel)
+
+// Extends active liquidity level drawings to the current bar without recreating objects.
+updateActiveLiquidityLevel(bool isHighSide, int eventBar, float eventPrice) =>
+    int slot = isHighSide ? 0 : 1
+    line existingLine = array.get(activeLiquidityLines, slot)
+    if not na(eventBar) and not na(eventPrice) and not na(existingLine)
+        color levelColor = isHighSide ? bearishColor : bullishColor
+        color lineColor = showLiquidity ? levelColor : color.new(levelColor, 100)
+        line.set_x1(existingLine, eventBar)
+        line.set_y1(existingLine, eventPrice)
+        line.set_x2(existingLine, bar_index)
+        line.set_y2(existingLine, eventPrice)
+        line.set_color(existingLine, lineColor)
+        array.set(activeLiquidityLines, slot, existingLine)
+
+// Deletes an inactive, invalidated, or expired liquidity level drawing.
+removeActiveLiquidityLevel(bool isHighSide) =>
+    int slot = isHighSide ? 0 : 1
+    line existingLine = array.get(activeLiquidityLines, slot)
+    label existingLabel = array.get(activeLiquidityLabels, slot)
+    if not na(existingLine)
+        line.delete(existingLine)
+        array.set(activeLiquidityLines, slot, na)
+    if not na(existingLabel)
+        label.delete(existingLabel)
+        array.set(activeLiquidityLabels, slot, na)
+
+// ============================================================================
+// Market Structure Helpers
+// ============================================================================
+
+// Returns the confirmed pivot high price for the configured swing length.
+getSwingHigh(int length) =>
+    ta.pivothigh(high, length, length)
+
+// Returns the confirmed pivot low price for the configured swing length.
+getSwingLow(int length) =>
+    ta.pivotlow(low, length, length)
+
+// Returns the bar index where a confirmed pivot occurred.
+getPivotBar(int length) =>
+    bar_index - length
+
+// Classifies a new swing high as SH, HH, or LH.
+classifySwingHigh(float swingPrice, float previousSwingHigh) =>
+    na(previousSwingHigh) ? STRUCTURE_SH : swingPrice > previousSwingHigh ? STRUCTURE_HH : STRUCTURE_LH
+
+// Classifies a new swing low as SL, HL, or LL.
+classifySwingLow(float swingPrice, float previousSwingLow) =>
+    na(previousSwingLow) ? STRUCTURE_SL : swingPrice > previousSwingLow ? STRUCTURE_HL : STRUCTURE_LL
+
+// Derives structural trend from the latest swing high and swing low classifications.
+deriveStructuralTrend(string swingHighType, string swingLowType, int currentTrend) =>
+    swingHighType == STRUCTURE_HH and swingLowType == STRUCTURE_HL ? TREND_BULLISH : swingHighType == STRUCTURE_LH and swingLowType == STRUCTURE_LL ? TREND_BEARISH : currentTrend
+
+// ============================================================================
+// Liquidity Helpers
+// ============================================================================
+
+// Converts tolerance percent into an absolute price distance.
+getLiquidityTolerance(float referencePrice) =>
+    math.abs(referencePrice) * liquidityTolerancePercent * 0.01
+
+// Returns true when two prices are within the configured liquidity tolerance.
+isEqualLiquidity(float priceA, float priceB) =>
+    not na(priceA) and not na(priceB) and math.abs(priceA - priceB) <= getLiquidityTolerance(priceA)
+
+// ============================================================================
+// FVG Helpers
+// ============================================================================
+
+// Creates a new FVG object with default active state.
+newFVG(string fvgType, float top, float bottom, int creationBar, box zoneBox) =>
+    FVG.new(fvgType, top, bottom, creationBar, na, 0.0, true, false, false, false, false, zoneBox)
+
+// Returns true when an FVG is bullish.
+isBullishFVG(FVG fvg) =>
+    fvg.fvgType == FVG_BULLISH
+
+// Returns true when an FVG is bearish.
+isBearishFVG(FVG fvg) =>
+    fvg.fvgType == FVG_BEARISH
+
+// Returns the normalized height of an FVG zone.
+getFVGRange(FVG fvg) =>
+    math.max(math.abs(fvg.top - fvg.bottom), syminfo.mintick)
+
+// Creates one FVG box for a unique FVG key and returns na when the FVG should be hidden.
+createFVGBox(string fvgType, float top, float bottom) =>
+    color zoneColor = fvgType == FVG_BULLISH ? fvgBullColor : fvgBearColor
+    showFVG ? box.new(bar_index - 2, top, bar_index, bottom, xloc=xloc.bar_index, bgcolor=zoneColor, border_color=color.new(color.white, 80)) : na
+
+// Updates an active FVG box and deletes inactive, invalidated, expired, or hidden boxes.
+updateFVGBox(FVG fvg) =>
+    FVG rendered = fvg
+    bool shouldRender = rendered.active and not rendered.invalidated and not rendered.expired and showFVG
+    if not shouldRender
+        if not na(rendered.zoneBox)
+            box.delete(rendered.zoneBox)
+            rendered.zoneBox := na
+    else if not na(rendered.zoneBox)
+        color zoneColor = isBullishFVG(rendered) ? fvgBullColor : fvgBearColor
+        box.set_right(rendered.zoneBox, bar_index)
+        box.set_top(rendered.zoneBox, rendered.top)
+        box.set_bottom(rendered.zoneBox, rendered.bottom)
+        box.set_bgcolor(rendered.zoneBox, zoneColor)
+        box.set_border_color(rendered.zoneBox, color.new(color.white, 80))
+    rendered
+
+// Calculates fill percentage using directional wick penetration.
+calculateFillPercentage(FVG fvg) =>
+    float zoneRange = getFVGRange(fvg)
+    float rawFill = 0.0
+    if isBullishFVG(fvg)
+        rawFill := low > fvg.top ? 0.0 : low <= fvg.bottom ? 100.0 : ((fvg.top - low) / zoneRange) * 100.0
+    if isBearishFVG(fvg)
+        rawFill := high < fvg.bottom ? 0.0 : high >= fvg.top ? 100.0 : ((high - fvg.bottom) / zoneRange) * 100.0
+    math.max(0.0, math.min(100.0, rawFill))
+
+// Returns true when price enters an active FVG zone.
+isFVGMitigated(FVG fvg) =>
+    fvg.active and bar_index > fvg.creationBar and high >= fvg.bottom and low <= fvg.top
+
+// Returns true when price retests a previously mitigated FVG zone.
+isFVGRetested(FVG fvg) =>
+    fvg.active and fvg.mitigated and not fvg.invalidated and bar_index > nz(fvg.mitigationBar, fvg.creationBar) and high >= fvg.bottom and low <= fvg.top
+
+// Returns true when an FVG has fully filled.
+isFVGInvalidated(FVG fvg) =>
+    (isBullishFVG(fvg) and low <= fvg.bottom) or (isBearishFVG(fvg) and high >= fvg.top)
+
+// Returns true when an FVG has exceeded its configured maximum age.
+isFVGExpired(FVG fvg) =>
+    bar_index - fvg.creationBar > fvgMaxAgeBars
+
+// Updates the state and existing drawing for one FVG object.
+updateFVGState(FVG fvg) =>
+    FVG updated = fvg
+    float currentFill = calculateFillPercentage(updated)
+    bool mitigatedNow = isFVGMitigated(updated)
+    bool retestedNow = isFVGRetested(updated)
+    bool invalidatedNow = isFVGInvalidated(updated)
+    bool expiredNow = isFVGExpired(updated)
+    updated.fillPercentage := math.max(updated.fillPercentage, currentFill)
+    updated.mitigationBar := mitigatedNow and na(updated.mitigationBar) ? bar_index : updated.mitigationBar
+    updated.mitigated := updated.mitigated or mitigatedNow
+    updated.retested := updated.retested or retestedNow
+    updated.invalidated := updated.invalidated or invalidatedNow
+    updated.expired := updated.expired or expiredNow
+    updated.active := not updated.invalidated and not updated.expired
+    updated := updateFVGBox(updated)
+    updated
+
+// Keeps only the most recent active FVG boxes and deletes older or inactive rendered boxes.
+enforceMaxActiveFVGBoxes() =>
+    int activeBoxCount = 0
+    if array.size(fvgs) > 0
+        for offset = 0 to array.size(fvgs) - 1
+            int index = array.size(fvgs) - 1 - offset
+            FVG currentFVG = array.get(fvgs, index)
+            bool canRemainRendered = currentFVG.active and not currentFVG.invalidated and not currentFVG.expired and showFVG
+            if canRemainRendered
+                activeBoxCount += 1
+                if activeBoxCount > maxActiveFVGBoxes and not na(currentFVG.zoneBox)
+                    box.delete(currentFVG.zoneBox)
+                    currentFVG.zoneBox := na
+                    array.set(fvgs, index, currentFVG)
+            else if not na(currentFVG.zoneBox)
+                box.delete(currentFVG.zoneBox)
+                currentFVG.zoneBox := na
+                array.set(fvgs, index, currentFVG)
+
+// ============================================================================
+// Order Block Helpers
+// ============================================================================
+
+// Creates a new active order block with normalized boundaries.
+newOrderBlock(string blockType, float top, float bottom, int originBar, box zoneBox) =>
+    OrderBlock.new(blockType, math.max(top, bottom), math.min(top, bottom), originBar, na, 0.0, true, false, false, false, false, false, zoneBox)
+
+// Returns true when an order block contains valid zone data.
+hasOrderBlock(OrderBlock orderBlock) =>
+    orderBlock.blockType != OB_NONE and not na(orderBlock.top) and not na(orderBlock.bottom) and not na(orderBlock.originBar)
+
+// Returns true when an order block is bullish.
+isBullishOrderBlock(OrderBlock orderBlock) =>
+    orderBlock.blockType == OB_BULLISH
+
+// Returns true when an order block is bearish.
+isBearishOrderBlock(OrderBlock orderBlock) =>
+    orderBlock.blockType == OB_BEARISH
+
+// Returns the normalized height of an order block zone.
+getOrderBlockRange(OrderBlock orderBlock) =>
+    math.max(math.abs(orderBlock.top - orderBlock.bottom), syminfo.mintick)
+
+// Calculates a visual-testing confidence score from zone size and lifecycle state.
+calculateOrderBlockConfidence(OrderBlock orderBlock, float atrValue) =>
+    float score = 0.0
+    if hasOrderBlock(orderBlock)
+        float safeAtr = math.max(atrValue, syminfo.mintick)
+        float sizeScore = math.min(getOrderBlockRange(orderBlock) / safeAtr, 2.0) / 2.0 * 35.0
+        float stateScore = orderBlock.active ? 35.0 : 0.0
+        float mitigationScore = orderBlock.mitigated ? 15.0 : 5.0
+        float retestScore = orderBlock.retested ? 10.0 : 0.0
+        float penalty = orderBlock.invalidated ? 60.0 : orderBlock.breaker ? 25.0 : 0.0
+        score := sizeScore + stateScore + mitigationScore + retestScore - penalty
+    math.max(0.0, math.min(100.0, score))
+
+// Draws a new order block box once, then extends and updates the same persistent box on later bars.
+drawOrderBlock(OrderBlock orderBlock) =>
+    OrderBlock renderedBlock = orderBlock
+    if hasOrderBlock(renderedBlock)
+        color zoneColor = isBullishOrderBlock(renderedBlock) ? obBullColor : obBearColor
+        color borderColor = renderedBlock.invalidated ? neutralColor : isBullishOrderBlock(renderedBlock) ? bullishColor : bearishColor
+        if na(renderedBlock.zoneBox)
+            renderedBlock.zoneBox := box.new(renderedBlock.originBar, renderedBlock.top, bar_index, renderedBlock.bottom, xloc=xloc.bar_index, bgcolor=showOrderBlocks and renderedBlock.active ? zoneColor : inactiveBoxColor, border_color=borderColor)
+        else
+            box.set_left(renderedBlock.zoneBox, renderedBlock.originBar)
+            box.set_right(renderedBlock.zoneBox, bar_index)
+            box.set_top(renderedBlock.zoneBox, renderedBlock.top)
+            box.set_bottom(renderedBlock.zoneBox, renderedBlock.bottom)
+            box.set_bgcolor(renderedBlock.zoneBox, showOrderBlocks and renderedBlock.active ? zoneColor : inactiveBoxColor)
+            box.set_border_color(renderedBlock.zoneBox, borderColor)
+    renderedBlock
+
+// Detects the last bearish candle before a confirmed bullish BOS.
+detectBullOrderBlock(bool bullishBOS) =>
+    OrderBlock detectedBlock = OrderBlock.new(OB_NONE, na, na, na, na, 0.0, false, false, false, false, false, false, na)
+    bool foundOrigin = false
+    if bullishBOS and barstate.isconfirmed
+        for offset = 1 to orderBlockLookback
+            if not foundOrigin and close[offset] < open[offset]
+                detectedBlock := newOrderBlock(OB_BULLISH, high[offset], low[offset], bar_index - offset, na)
+                foundOrigin := true
+    detectedBlock
+
+// Detects the last bullish candle before a confirmed bearish BOS.
+detectBearOrderBlock(bool bearishBOS) =>
+    OrderBlock detectedBlock = OrderBlock.new(OB_NONE, na, na, na, na, 0.0, false, false, false, false, false, false, na)
+    bool foundOrigin = false
+    if bearishBOS and barstate.isconfirmed
+        for offset = 1 to orderBlockLookback
+            if not foundOrigin and close[offset] > open[offset]
+                detectedBlock := newOrderBlock(OB_BEARISH, high[offset], low[offset], bar_index - offset, na)
+                foundOrigin := true
+    detectedBlock
+
+// Returns true when price first trades back into an active order block zone after origin creation.
+isOrderBlockMitigated(OrderBlock orderBlock) =>
+    hasOrderBlock(orderBlock) and orderBlock.active and bar_index > orderBlock.originBar and high >= orderBlock.bottom and low <= orderBlock.top
+
+// Returns true when price revisits a mitigated order block after its first mitigation bar.
+isOrderBlockRetested(OrderBlock orderBlock) =>
+    hasOrderBlock(orderBlock) and orderBlock.active and orderBlock.mitigated and not orderBlock.invalidated and not na(orderBlock.mitigationBar) and bar_index > orderBlock.mitigationBar and high >= orderBlock.bottom and low <= orderBlock.top
+
+// Returns true when price closes through the far side of an order block and invalidates the zone.
+isOrderBlockInvalidated(OrderBlock orderBlock) =>
+    hasOrderBlock(orderBlock) and ((isBullishOrderBlock(orderBlock) and close < orderBlock.bottom) or (isBearishOrderBlock(orderBlock) and close > orderBlock.top))
+
+// Returns true when an order block has exceeded its configured maximum age.
+isOrderBlockExpired(OrderBlock orderBlock) =>
+    hasOrderBlock(orderBlock) and bar_index - orderBlock.originBar > orderBlockMaxAgeBars
+
+// Updates lifecycle state and persistent drawing for one order block.
+updateOrderBlockState(OrderBlock orderBlock, float atrValue) =>
+    OrderBlock updated = orderBlock
+    if hasOrderBlock(updated)
+        bool mitigatedNow = isOrderBlockMitigated(updated)
+        bool retestedNow = isOrderBlockRetested(updated)
+        bool invalidatedNow = isOrderBlockInvalidated(updated)
+        bool expiredNow = isOrderBlockExpired(updated)
+        updated.mitigationBar := mitigatedNow and na(updated.mitigationBar) ? bar_index : updated.mitigationBar
+        updated.mitigated := updated.mitigated or mitigatedNow
+        updated.retested := updated.retested or retestedNow
+        updated.invalidated := updated.invalidated or invalidatedNow
+        updated.breaker := updated.breaker or invalidatedNow
+        updated.expired := updated.expired or expiredNow
+        updated.active := not updated.invalidated and not updated.expired
+        updated.confidence := calculateOrderBlockConfidence(updated, atrValue)
+        updated := drawOrderBlock(updated)
+    updated
+
+// ============================================================================
+// Market Structure Engine
+// ============================================================================
+
+float swingHigh = getSwingHigh(swingLength)
+float swingLow = getSwingLow(swingLength)
+float atrValue = ta.atr(atrLength)
+
+bool bullishBreak = not na(protectedHigh) and not na(protectedHighBar) and (na(lastBrokenHighBar) or protectedHighBar != lastBrokenHighBar) and close > protectedHigh
+bool bearishBreak = not bullishBreak and not na(protectedLow) and not na(protectedLowBar) and (na(lastBrokenLowBar) or protectedLowBar != lastBrokenLowBar) and close < protectedLow
+
+if bullishBreak
+    string bullishEvent = marketTrend == TREND_BEARISH ? EVENT_CHOCH : EVENT_BOS
+    lastStructureEvent := bullishEvent
+    lastStructurePrice := protectedHigh
+    renderStructureBreak(protectedHighBar, protectedHigh, bullishEvent, true)
+    OrderBlock bullishOrderBlock = detectBullOrderBlock(true)
+    if hasOrderBlock(bullishOrderBlock)
+        string obKey = buildVisualKey("ORDER_BLOCK", bullishOrderBlock.originBar, bullishOrderBlock.top, bullishOrderBlock.blockType + "|" + formatPrice(bullishOrderBlock.bottom))
+        if findVisualKeyIndex(orderBlockRenderKeys, obKey) == -1
+            bullishOrderBlock := drawOrderBlock(bullishOrderBlock)
+            array.push(orderBlockRenderKeys, obKey)
+            array.push(orderBlocks, bullishOrderBlock)
+            lastOrderBlockIndex := array.size(orderBlocks) - 1
+    marketTrend := TREND_BULLISH
+    lastBrokenHighBar := protectedHighBar
+    protectedHigh := na
+    protectedHighBar := na
+else if bearishBreak
+    string bearishEvent = marketTrend == TREND_BULLISH ? EVENT_CHOCH : EVENT_BOS
+    lastStructureEvent := bearishEvent
+    lastStructurePrice := protectedLow
+    renderStructureBreak(protectedLowBar, protectedLow, bearishEvent, false)
+    OrderBlock bearishOrderBlock = detectBearOrderBlock(true)
+    if hasOrderBlock(bearishOrderBlock)
+        string obKey = buildVisualKey("ORDER_BLOCK", bearishOrderBlock.originBar, bearishOrderBlock.bottom, bearishOrderBlock.blockType + "|" + formatPrice(bearishOrderBlock.top))
+        if findVisualKeyIndex(orderBlockRenderKeys, obKey) == -1
+            bearishOrderBlock := drawOrderBlock(bearishOrderBlock)
+            array.push(orderBlockRenderKeys, obKey)
+            array.push(orderBlocks, bearishOrderBlock)
+            lastOrderBlockIndex := array.size(orderBlocks) - 1
+    marketTrend := TREND_BEARISH
+    lastBrokenLowBar := protectedLowBar
+    protectedLow := na
+    protectedLowBar := na
+
+if not na(swingHigh)
+    int swingHighBar = getPivotBar(swingLength)
+    string swingHighType = classifySwingHigh(swingHigh, lastSwingHigh)
+    renderSwingLabel(swingHighBar, swingHigh, swingHighType, true)
+    lastSwingHigh := swingHigh
+    lastSwingHighBar := swingHighBar
+    lastSwingHighType := swingHighType
+    protectedHigh := swingHigh
+    protectedHighBar := swingHighBar
+
+if not na(swingLow)
+    int swingLowBar = getPivotBar(swingLength)
+    string swingLowType = classifySwingLow(swingLow, lastSwingLow)
+    renderSwingLabel(swingLowBar, swingLow, swingLowType, false)
+    lastSwingLow := swingLow
+    lastSwingLowBar := swingLowBar
+    lastSwingLowType := swingLowType
+    protectedLow := swingLow
+    protectedLowBar := swingLowBar
+
+marketTrend := deriveStructuralTrend(lastSwingHighType, lastSwingLowType, marketTrend)
+
+// ============================================================================
+// Liquidity Engine
+// ============================================================================
+
+float liquidityHigh = ta.pivothigh(high, liquidityLookback, liquidityLookback)
+float liquidityLow = ta.pivotlow(low, liquidityLookback, liquidityLookback)
+int liquidityPivotBar = bar_index - liquidityLookback
+
+bool buySideLiquidityExpired = not na(lastLiquidityHighBar) and bar_index - lastLiquidityHighBar > liquidityRenderMaxAgeBars
+bool sellSideLiquidityExpired = not na(lastLiquidityLowBar) and bar_index - lastLiquidityLowBar > liquidityRenderMaxAgeBars
+
+if buySideLiquidityExpired
+    removeActiveLiquidityLevel(true)
+    lastLiquidityHigh := na
+    lastLiquidityHighBar := na
+
+if sellSideLiquidityExpired
+    removeActiveLiquidityLevel(false)
+    lastLiquidityLow := na
+    lastLiquidityLowBar := na
+
+if not na(liquidityHigh)
+    bool equalActiveHigh = not na(lastLiquidityHigh) and isEqualLiquidity(liquidityHigh, lastLiquidityHigh)
+    bool supersedesBuySide = na(lastLiquidityHigh) or liquidityHigh > lastLiquidityHigh
+    if equalActiveHigh
+        renderActiveLiquidityLevel(true, liquidityPivotBar, lastLiquidityHigh, EVENT_EQH)
+        lastLiquidityEvent := EVENT_EQH
+        lastLiquidityPrice := lastLiquidityHigh
+    else if supersedesBuySide
+        renderActiveLiquidityLevel(true, liquidityPivotBar, liquidityHigh, EVENT_BSL)
+        lastLiquidityHigh := liquidityHigh
+        lastLiquidityHighBar := liquidityPivotBar
+        lastLiquidityEvent := EVENT_BSL
+        lastLiquidityPrice := liquidityHigh
+
+if not na(liquidityLow)
+    bool equalActiveLow = not na(lastLiquidityLow) and isEqualLiquidity(liquidityLow, lastLiquidityLow)
+    bool supersedesSellSide = na(lastLiquidityLow) or liquidityLow < lastLiquidityLow
+    if equalActiveLow
+        renderActiveLiquidityLevel(false, liquidityPivotBar, lastLiquidityLow, EVENT_EQL)
+        lastLiquidityEvent := EVENT_EQL
+        lastLiquidityPrice := lastLiquidityLow
+    else if supersedesSellSide
+        renderActiveLiquidityLevel(false, liquidityPivotBar, liquidityLow, EVENT_SSL)
+        lastLiquidityLow := liquidityLow
+        lastLiquidityLowBar := liquidityPivotBar
+        lastLiquidityEvent := EVENT_SSL
+        lastLiquidityPrice := liquidityLow
+
+bool sweepHigh = not na(lastLiquidityHigh) and not na(lastLiquidityHighBar) and bar_index > lastLiquidityHighBar and high > lastLiquidityHigh and close < lastLiquidityHigh
+bool sweepLow = not na(lastLiquidityLow) and not na(lastLiquidityLowBar) and bar_index > lastLiquidityLowBar and low < lastLiquidityLow and close > lastLiquidityLow
+bool buySideLiquidityInvalidated = not na(lastLiquidityHigh) and not sweepHigh and high > lastLiquidityHigh and close >= lastLiquidityHigh
+bool sellSideLiquidityInvalidated = not na(lastLiquidityLow) and not sweepLow and low < lastLiquidityLow and close <= lastLiquidityLow
+
+if sweepHigh
+    renderLiquidityLabel(bar_index, lastLiquidityHigh, EVENT_SWEEP_HIGH, true)
+    removeActiveLiquidityLevel(true)
+    lastLiquidityEvent := EVENT_SWEEP_HIGH
+    lastLiquidityPrice := lastLiquidityHigh
+    lastLiquidityHigh := na
+    lastLiquidityHighBar := na
+else if buySideLiquidityInvalidated
+    removeActiveLiquidityLevel(true)
+    lastLiquidityHigh := na
+    lastLiquidityHighBar := na
+
+if sweepLow
+    renderLiquidityLabel(bar_index, lastLiquidityLow, EVENT_SWEEP_LOW, false)
+    removeActiveLiquidityLevel(false)
+    lastLiquidityEvent := EVENT_SWEEP_LOW
+    lastLiquidityPrice := lastLiquidityLow
+    lastLiquidityLow := na
+    lastLiquidityLowBar := na
+else if sellSideLiquidityInvalidated
+    removeActiveLiquidityLevel(false)
+    lastLiquidityLow := na
+    lastLiquidityLowBar := na
+
+if not na(lastLiquidityHigh)
+    updateActiveLiquidityLevel(true, lastLiquidityHighBar, lastLiquidityHigh)
+
+if not na(lastLiquidityLow)
+    updateActiveLiquidityLevel(false, lastLiquidityLowBar, lastLiquidityLow)
+
+// ============================================================================
+// FVG Engine
+// ============================================================================
+
+bool bullFVGDetected = barstate.isconfirmed and bar_index >= 2 and low > high[2]
+bool bearFVGDetected = barstate.isconfirmed and bar_index >= 2 and high < low[2]
+
+if bullFVGDetected
+    string fvgKey = buildVisualKey("FVG", bar_index, low, FVG_BULLISH + "|" + formatPrice(high[2]))
+    if findVisualKeyIndex(fvgRenderKeys, fvgKey) == -1
+        box bullBox = createFVGBox(FVG_BULLISH, low, high[2])
+        array.push(fvgRenderKeys, fvgKey)
+        array.push(fvgs, newFVG(FVG_BULLISH, low, high[2], bar_index, bullBox))
+        lastFVGIndex := array.size(fvgs) - 1
+
+if bearFVGDetected
+    string fvgKey = buildVisualKey("FVG", bar_index, low[2], FVG_BEARISH + "|" + formatPrice(high))
+    if findVisualKeyIndex(fvgRenderKeys, fvgKey) == -1
+        box bearBox = createFVGBox(FVG_BEARISH, low[2], high)
+        array.push(fvgRenderKeys, fvgKey)
+        array.push(fvgs, newFVG(FVG_BEARISH, low[2], high, bar_index, bearBox))
+        lastFVGIndex := array.size(fvgs) - 1
+
+if array.size(fvgs) > 0
+    for index = 0 to array.size(fvgs) - 1
+        FVG currentFVG = array.get(fvgs, index)
+        FVG updatedFVG = updateFVGState(currentFVG)
+        array.set(fvgs, index, updatedFVG)
+    enforceMaxActiveFVGBoxes()
+
+// ============================================================================
+// Order Block Engine
+// ============================================================================
+
+if array.size(orderBlocks) > 0
+    for index = 0 to array.size(orderBlocks) - 1
+        OrderBlock currentOrderBlock = array.get(orderBlocks, index)
+        OrderBlock updatedOrderBlock = updateOrderBlockState(currentOrderBlock, atrValue)
+        array.set(orderBlocks, index, updatedOrderBlock)
+
+// ============================================================================
+// DEV Panel
+// ============================================================================
+
+string lastFVGType = "None"
+string lastFVGStatus = "-"
+color lastFVGColor = neutralColor
+
+if not na(lastFVGIndex) and array.size(fvgs) > 0 and lastFVGIndex >= 0 and lastFVGIndex < array.size(fvgs)
+    FVG panelFVG = array.get(fvgs, lastFVGIndex)
+    lastFVGType := panelFVG.fvgType
+    lastFVGStatus := panelFVG.invalidated ? "Invalidated" : panelFVG.expired ? "Expired" : panelFVG.active ? "Active" : "Inactive"
+    lastFVGColor := panelFVG.invalidated or panelFVG.expired ? neutralColor : isBullishFVG(panelFVG) ? bullishColor : bearishColor
+
+string lastOrderBlockType = "None"
+string lastOrderBlockStatus = "-"
+color lastOrderBlockColor = neutralColor
+
+if not na(lastOrderBlockIndex) and array.size(orderBlocks) > 0 and lastOrderBlockIndex >= 0 and lastOrderBlockIndex < array.size(orderBlocks)
+    OrderBlock panelOrderBlock = array.get(orderBlocks, lastOrderBlockIndex)
+    lastOrderBlockType := panelOrderBlock.blockType
+    lastOrderBlockStatus := panelOrderBlock.invalidated ? "Breaker" : panelOrderBlock.expired ? "Expired" : panelOrderBlock.active ? "Active" : "Inactive"
+    lastOrderBlockColor := panelOrderBlock.invalidated or panelOrderBlock.expired ? neutralColor : isBullishOrderBlock(panelOrderBlock) ? bullishColor : bearishColor
+
+if barstate.islast
+    if showPanel
+        setPanelRow(0, "Market Trend", getTrendText(marketTrend), getTrendColor(marketTrend))
+        setPanelRow(1, "Last BOS/CHOCH", formatEventPrice(lastStructureEvent, lastStructurePrice), getTrendColor(marketTrend))
+        setPanelRow(2, "Liquidity", formatEventPrice(lastLiquidityEvent, lastLiquidityPrice), neutralColor)
+        setPanelRow(3, "FVG", lastFVGType + " / " + lastFVGStatus, lastFVGColor)
+        setPanelRow(4, "Order Block", lastOrderBlockType + " / " + lastOrderBlockStatus, lastOrderBlockColor)
+    else
+        table.clear(devPanel, 0, 0, 1, 4)

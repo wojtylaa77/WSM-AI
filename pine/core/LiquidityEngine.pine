@@ -1,0 +1,362 @@
+//@version=6
+library("WSM_AI_LiquidityEngine", overlay=true)
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const string EVENT_NONE = "None"
+const string EVENT_EQH = "EQH"
+const string EVENT_EQL = "EQL"
+const string EVENT_BSL = "BSL"
+const string EVENT_SSL = "SSL"
+const string EVENT_SWEEP_HIGH = "Liquidity Sweep High"
+const string EVENT_SWEEP_LOW = "Liquidity Sweep Low"
+const string EVENT_GRAB_HIGH = "Liquidity Grab High"
+const string EVENT_GRAB_LOW = "Liquidity Grab Low"
+const string EVENT_FAILED_SWEEP_HIGH = "Failed Sweep High"
+const string EVENT_FAILED_SWEEP_LOW = "Failed Sweep Low"
+
+const string SCOPE_NONE = "None"
+const string SCOPE_INTERNAL = "Internal"
+const string SCOPE_EXTERNAL = "External"
+
+const string TOLERANCE_PERCENT = "Percent"
+const string TOLERANCE_ATR = "ATR"
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export type LiquidityEvent
+    string eventType
+    float price
+    int barIndex
+    float confidence
+    string liquidityScope
+
+// ============================================================================
+// Active Liquidity State
+// ============================================================================
+
+var array<float> activeBuySidePrices = array.new<float>(2, na)
+var array<int> activeBuySideBars = array.new<int>(2, na)
+var array<bool> activeBuySideFlags = array.new<bool>(2, false)
+var array<float> activeSellSidePrices = array.new<float>(2, na)
+var array<int> activeSellSideBars = array.new<int>(2, na)
+var array<bool> activeSellSideFlags = array.new<bool>(2, false)
+
+// ============================================================================
+// Event Helpers
+// ============================================================================
+
+// Creates a standardized liquidity event payload for downstream engines and future AI scoring.
+export newLiquidityEvent(string eventType, float price, int barIndex, float confidence, string liquidityScope) =>
+    LiquidityEvent.new(eventType, price, barIndex, confidence, liquidityScope)
+
+// Creates an empty liquidity event payload for bars where no liquidity event is detected.
+export noLiquidityEvent() =>
+    LiquidityEvent.new(EVENT_NONE, na, na, 0.0, SCOPE_NONE)
+
+// Returns true when a liquidity event contains a real detected event.
+export hasLiquidityEvent(LiquidityEvent liquidityEvent) =>
+    liquidityEvent.eventType != EVENT_NONE and not na(liquidityEvent.price) and not na(liquidityEvent.barIndex)
+
+// Clamps a confidence value to the engine's normalized 0-100 scoring range.
+clampConfidence(float value) =>
+    math.max(0.0, math.min(100.0, value))
+
+// Returns the liquidity scope name from a boolean external/internal flag.
+getLiquidityScope(bool isExternal) =>
+    isExternal ? SCOPE_EXTERNAL : SCOPE_INTERNAL
+
+// ============================================================================
+// Tolerance Helpers
+// ============================================================================
+
+// Converts the configured tolerance mode into an absolute price distance.
+getTolerance(float referencePrice, string toleranceMode, float toleranceValue, int atrLength) =>
+    float percentTolerance = math.abs(referencePrice) * toleranceValue * 0.01
+    float atrTolerance = ta.atr(atrLength) * toleranceValue
+    toleranceMode == TOLERANCE_ATR ? atrTolerance : percentTolerance
+
+// Returns true when two prices are inside the configured tolerance band.
+isWithinTolerance(float priceA, float priceB, string toleranceMode, float toleranceValue, int atrLength) =>
+    not na(priceA) and not na(priceB) and math.abs(priceA - priceB) <= getTolerance(priceA, toleranceMode, toleranceValue, atrLength)
+
+// Scores how tightly two prices align inside the configured tolerance band.
+scoreToleranceFit(float priceA, float priceB, string toleranceMode, float toleranceValue, int atrLength) =>
+    float tolerance = getTolerance(priceA, toleranceMode, toleranceValue, atrLength)
+    float distance = math.abs(priceA - priceB)
+    float rawScore = tolerance <= 0.0 ? 0.0 : 100.0 - (distance / tolerance) * 35.0
+    clampConfidence(rawScore)
+
+// Scores the strength of a sweep or grab using penetration beyond the liquidity level.
+scorePenetration(float penetration, float referencePrice, string toleranceMode, float toleranceValue, int atrLength) =>
+    float tolerance = getTolerance(referencePrice, toleranceMode, toleranceValue, atrLength)
+    float rawScore = tolerance <= 0.0 ? 50.0 : 65.0 + math.min(35.0, (penetration / tolerance) * 15.0)
+    clampConfidence(rawScore)
+
+// Gives external liquidity a modest confidence premium over internal liquidity.
+scoreScopePremium(bool isExternal) =>
+    isExternal ? 10.0 : 0.0
+
+// ============================================================================
+// Pivot Helpers
+// ============================================================================
+
+// Returns the confirmed pivot bar index for a pivot confirmed on the current bar.
+getConfirmedPivotBar(int lookback) =>
+    bar_index - lookback
+
+// Returns the latest confirmed pivot high using symmetrical left/right lookback.
+getConfirmedPivotHigh(series float highSource, int lookback) =>
+    ta.pivothigh(highSource, lookback, lookback)
+
+// Returns the latest confirmed pivot low using symmetrical left/right lookback.
+getConfirmedPivotLow(series float lowSource, int lookback) =>
+    ta.pivotlow(lowSource, lookback, lookback)
+
+// Returns the previous confirmed pivot high before the pivot confirmed on this bar.
+getPreviousPivotHigh(series float highSource, int lookback) =>
+    float pivotHigh = getConfirmedPivotHigh(highSource, lookback)
+    ta.valuewhen(not na(pivotHigh), pivotHigh, 1)
+
+// Returns the previous confirmed pivot low before the pivot confirmed on this bar.
+getPreviousPivotLow(series float lowSource, int lookback) =>
+    float pivotLow = getConfirmedPivotLow(lowSource, lookback)
+    ta.valuewhen(not na(pivotLow), pivotLow, 1)
+
+// Returns the internal state slot for internal or external liquidity.
+getStateSlot(bool isExternal) =>
+    isExternal ? 1 : 0
+
+// Returns the maximum age before an active liquidity level is expired by lifecycle management.
+getLiquidityMaxAge(int lookback) =>
+    math.max(lookback * 20, lookback + 1)
+
+// Returns true when an active buy-side liquidity slot contains a valid protected level.
+hasActiveBuySideLiquidity(int slot) =>
+    array.get(activeBuySideFlags, slot) and not na(array.get(activeBuySidePrices, slot)) and not na(array.get(activeBuySideBars, slot))
+
+// Returns true when an active sell-side liquidity slot contains a valid protected level.
+hasActiveSellSideLiquidity(int slot) =>
+    array.get(activeSellSideFlags, slot) and not na(array.get(activeSellSidePrices, slot)) and not na(array.get(activeSellSideBars, slot))
+
+// Stores one active protected buy-side liquidity level and replaces the prior level in the same scope.
+setActiveBuySideLiquidity(int slot, float price, int levelBar) =>
+    array.set(activeBuySidePrices, slot, price)
+    array.set(activeBuySideBars, slot, levelBar)
+    array.set(activeBuySideFlags, slot, true)
+    true
+
+// Stores one active protected sell-side liquidity level and replaces the prior level in the same scope.
+setActiveSellSideLiquidity(int slot, float price, int levelBar) =>
+    array.set(activeSellSidePrices, slot, price)
+    array.set(activeSellSideBars, slot, levelBar)
+    array.set(activeSellSideFlags, slot, true)
+    true
+
+// Removes the active protected buy-side liquidity level from the selected scope.
+clearActiveBuySideLiquidity(int slot) =>
+    array.set(activeBuySidePrices, slot, na)
+    array.set(activeBuySideBars, slot, na)
+    array.set(activeBuySideFlags, slot, false)
+    true
+
+// Removes the active protected sell-side liquidity level from the selected scope.
+clearActiveSellSideLiquidity(int slot) =>
+    array.set(activeSellSidePrices, slot, na)
+    array.set(activeSellSideBars, slot, na)
+    array.set(activeSellSideFlags, slot, false)
+    true
+
+// Expires old buy-side liquidity so stale pivots are not treated as active protected liquidity.
+expireBuySideLiquidity(int slot, int lookback) =>
+    bool expired = hasActiveBuySideLiquidity(slot) and bar_index - array.get(activeBuySideBars, slot) > getLiquidityMaxAge(lookback)
+    if expired
+        clearActiveBuySideLiquidity(slot)
+    expired
+
+// Expires old sell-side liquidity so stale pivots are not treated as active protected liquidity.
+expireSellSideLiquidity(int slot, int lookback) =>
+    bool expired = hasActiveSellSideLiquidity(slot) and bar_index - array.get(activeSellSideBars, slot) > getLiquidityMaxAge(lookback)
+    if expired
+        clearActiveSellSideLiquidity(slot)
+    expired
+
+// Returns the active protected buy-side liquidity level for the selected scope.
+getActiveBuySideLiquidity(bool isExternal, int lookback) =>
+    int slot = getStateSlot(isExternal)
+    expireBuySideLiquidity(slot, lookback)
+    hasActiveBuySideLiquidity(slot) ? array.get(activeBuySidePrices, slot) : na
+
+// Returns the active protected sell-side liquidity level for the selected scope.
+getActiveSellSideLiquidity(bool isExternal, int lookback) =>
+    int slot = getStateSlot(isExternal)
+    expireSellSideLiquidity(slot, lookback)
+    hasActiveSellSideLiquidity(slot) ? array.get(activeSellSidePrices, slot) : na
+
+// Returns the bar index of the active protected buy-side liquidity level for the selected scope.
+getActiveBuySideLiquidityBar(bool isExternal, int lookback) =>
+    int slot = getStateSlot(isExternal)
+    expireBuySideLiquidity(slot, lookback)
+    hasActiveBuySideLiquidity(slot) ? array.get(activeBuySideBars, slot) : na
+
+// Returns the bar index of the active protected sell-side liquidity level for the selected scope.
+getActiveSellSideLiquidityBar(bool isExternal, int lookback) =>
+    int slot = getStateSlot(isExternal)
+    expireSellSideLiquidity(slot, lookback)
+    hasActiveSellSideLiquidity(slot) ? array.get(activeSellSideBars, slot) : na
+
+// ============================================================================
+// Equal High / Equal Low Detection
+// ============================================================================
+
+// Detects equal highs between the latest confirmed pivot high and the previous confirmed pivot high.
+export detectEQH(series float highSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    float pivotHigh = getConfirmedPivotHigh(highSource, lookback)
+    float previousPivotHigh = getPreviousPivotHigh(highSource, lookback)
+    bool equalHigh = not na(pivotHigh) and isWithinTolerance(pivotHigh, previousPivotHigh, toleranceMode, toleranceValue, atrLength)
+    float confidence = equalHigh ? clampConfidence(scoreToleranceFit(pivotHigh, previousPivotHigh, toleranceMode, toleranceValue, atrLength) + scoreScopePremium(isExternal)) : 0.0
+    equalHigh ? newLiquidityEvent(EVENT_EQH, pivotHigh, getConfirmedPivotBar(lookback), confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects equal lows between the latest confirmed pivot low and the previous confirmed pivot low.
+export detectEQL(series float lowSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    float pivotLow = getConfirmedPivotLow(lowSource, lookback)
+    float previousPivotLow = getPreviousPivotLow(lowSource, lookback)
+    bool equalLow = not na(pivotLow) and isWithinTolerance(pivotLow, previousPivotLow, toleranceMode, toleranceValue, atrLength)
+    float confidence = equalLow ? clampConfidence(scoreToleranceFit(pivotLow, previousPivotLow, toleranceMode, toleranceValue, atrLength) + scoreScopePremium(isExternal)) : 0.0
+    equalLow ? newLiquidityEvent(EVENT_EQL, pivotLow, getConfirmedPivotBar(lookback), confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// ============================================================================
+// BSL / SSL Zone Detection
+// ============================================================================
+
+// Detects newly confirmed protected buy-side liquidity from a meaningful pivot high.
+export detectBSL(series float highSource, int lookback, bool isExternal) =>
+    int slot = getStateSlot(isExternal)
+    expireBuySideLiquidity(slot, lookback)
+    float pivotHigh = getConfirmedPivotHigh(highSource, lookback)
+    int pivotBar = getConfirmedPivotBar(lookback)
+    bool hasPivot = not na(pivotHigh)
+    bool supersedesActive = hasPivot and (not hasActiveBuySideLiquidity(slot) or pivotHigh > array.get(activeBuySidePrices, slot))
+    float confidence = supersedesActive ? clampConfidence(70.0 + scoreScopePremium(isExternal)) : 0.0
+    if supersedesActive
+        setActiveBuySideLiquidity(slot, pivotHigh, pivotBar)
+    supersedesActive ? newLiquidityEvent(EVENT_BSL, pivotHigh, pivotBar, confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects newly confirmed protected sell-side liquidity from a meaningful pivot low.
+export detectSSL(series float lowSource, int lookback, bool isExternal) =>
+    int slot = getStateSlot(isExternal)
+    expireSellSideLiquidity(slot, lookback)
+    float pivotLow = getConfirmedPivotLow(lowSource, lookback)
+    int pivotBar = getConfirmedPivotBar(lookback)
+    bool hasPivot = not na(pivotLow)
+    bool supersedesActive = hasPivot and (not hasActiveSellSideLiquidity(slot) or pivotLow < array.get(activeSellSidePrices, slot))
+    float confidence = supersedesActive ? clampConfidence(70.0 + scoreScopePremium(isExternal)) : 0.0
+    if supersedesActive
+        setActiveSellSideLiquidity(slot, pivotLow, pivotBar)
+    supersedesActive ? newLiquidityEvent(EVENT_SSL, pivotLow, pivotBar, confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects newly confirmed internal buy-side and sell-side liquidity zones.
+export detectInternalLiquidity(series float highSource, series float lowSource, int internalLookback) =>
+    LiquidityEvent internalBSL = detectBSL(highSource, internalLookback, false)
+    LiquidityEvent internalSSL = detectSSL(lowSource, internalLookback, false)
+    [internalBSL, internalSSL]
+
+// Detects newly confirmed external buy-side and sell-side liquidity zones.
+export detectExternalLiquidity(series float highSource, series float lowSource, int externalLookback) =>
+    LiquidityEvent externalBSL = detectBSL(highSource, externalLookback, true)
+    LiquidityEvent externalSSL = detectSSL(lowSource, externalLookback, true)
+    [externalBSL, externalSSL]
+
+// Detects internal and external buy-side and sell-side liquidity zones in one call.
+export detectLiquidityZones(series float highSource, series float lowSource, int internalLookback, int externalLookback) =>
+    [LiquidityEvent internalBSL, LiquidityEvent internalSSL] = detectInternalLiquidity(highSource, lowSource, internalLookback)
+    [LiquidityEvent externalBSL, LiquidityEvent externalSSL] = detectExternalLiquidity(highSource, lowSource, externalLookback)
+    [internalBSL, internalSSL, externalBSL, externalSSL]
+
+// ============================================================================
+// Sweep / Grab / Failed Sweep Detection
+// ============================================================================
+
+// Detects a high-side liquidity sweep when price trades above buy-side liquidity and closes back below it.
+export detectSweepHigh(series float highSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    float level = getActiveBuySideLiquidity(isExternal, lookback)
+    int levelBar = getActiveBuySideLiquidityBar(isExternal, lookback)
+    float tolerance = na(level) ? na : getTolerance(level, toleranceMode, toleranceValue, atrLength)
+    bool hasLevel = barstate.isconfirmed and not na(level) and not na(levelBar) and bar_index > levelBar
+    bool sweptHigh = hasLevel and highSource > level + tolerance and closeSource < level
+    float confidence = sweptHigh ? clampConfidence(scorePenetration(highSource - level, level, toleranceMode, toleranceValue, atrLength) + scoreScopePremium(isExternal)) : 0.0
+    if sweptHigh
+        clearActiveBuySideLiquidity(getStateSlot(isExternal))
+    sweptHigh ? newLiquidityEvent(EVENT_SWEEP_HIGH, level, bar_index, confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects a low-side liquidity sweep when price trades below sell-side liquidity and closes back above it.
+export detectSweepLow(series float lowSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    float level = getActiveSellSideLiquidity(isExternal, lookback)
+    int levelBar = getActiveSellSideLiquidityBar(isExternal, lookback)
+    float tolerance = na(level) ? na : getTolerance(level, toleranceMode, toleranceValue, atrLength)
+    bool hasLevel = barstate.isconfirmed and not na(level) and not na(levelBar) and bar_index > levelBar
+    bool sweptLow = hasLevel and lowSource < level - tolerance and closeSource > level
+    float confidence = sweptLow ? clampConfidence(scorePenetration(level - lowSource, level, toleranceMode, toleranceValue, atrLength) + scoreScopePremium(isExternal)) : 0.0
+    if sweptLow
+        clearActiveSellSideLiquidity(getStateSlot(isExternal))
+    sweptLow ? newLiquidityEvent(EVENT_SWEEP_LOW, level, bar_index, confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects a high-side liquidity grab when price takes buy-side liquidity and accepts above it at the close.
+export detectGrabHigh(series float highSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    float level = getActiveBuySideLiquidity(isExternal, lookback)
+    int levelBar = getActiveBuySideLiquidityBar(isExternal, lookback)
+    float tolerance = na(level) ? na : getTolerance(level, toleranceMode, toleranceValue, atrLength)
+    bool hasLevel = barstate.isconfirmed and not na(level) and not na(levelBar) and bar_index > levelBar
+    bool grabbedHigh = hasLevel and highSource > level + tolerance and closeSource >= level
+    float confidence = grabbedHigh ? clampConfidence(scorePenetration(highSource - level, level, toleranceMode, toleranceValue, atrLength) - 10.0 + scoreScopePremium(isExternal)) : 0.0
+    if grabbedHigh
+        clearActiveBuySideLiquidity(getStateSlot(isExternal))
+    grabbedHigh ? newLiquidityEvent(EVENT_GRAB_HIGH, level, bar_index, confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects a low-side liquidity grab when price takes sell-side liquidity and accepts below it at the close.
+export detectGrabLow(series float lowSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    float level = getActiveSellSideLiquidity(isExternal, lookback)
+    int levelBar = getActiveSellSideLiquidityBar(isExternal, lookback)
+    float tolerance = na(level) ? na : getTolerance(level, toleranceMode, toleranceValue, atrLength)
+    bool hasLevel = barstate.isconfirmed and not na(level) and not na(levelBar) and bar_index > levelBar
+    bool grabbedLow = hasLevel and lowSource < level - tolerance and closeSource <= level
+    float confidence = grabbedLow ? clampConfidence(scorePenetration(level - lowSource, level, toleranceMode, toleranceValue, atrLength) - 10.0 + scoreScopePremium(isExternal)) : 0.0
+    if grabbedLow
+        clearActiveSellSideLiquidity(getStateSlot(isExternal))
+    grabbedLow ? newLiquidityEvent(EVENT_GRAB_LOW, level, bar_index, confidence, getLiquidityScope(isExternal)) : noLiquidityEvent()
+
+// Detects a failed high-side sweep after the prior bar swept buy-side liquidity and the current close confirms continuation lower.
+export detectFailedSweepHigh(series float highSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    LiquidityEvent priorSweep = detectSweepHigh(highSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)[1]
+    bool failedSweep = hasLiquidityEvent(priorSweep) and barstate.isconfirmed and closeSource < priorSweep.price
+    float confidence = failedSweep ? clampConfidence(priorSweep.confidence + 5.0) : 0.0
+    failedSweep ? newLiquidityEvent(EVENT_FAILED_SWEEP_HIGH, priorSweep.price, bar_index, confidence, priorSweep.liquidityScope) : noLiquidityEvent()
+
+// Detects a failed low-side sweep after the prior bar swept sell-side liquidity and the current close confirms continuation higher.
+export detectFailedSweepLow(series float lowSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    LiquidityEvent priorSweep = detectSweepLow(lowSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)[1]
+    bool failedSweep = hasLiquidityEvent(priorSweep) and barstate.isconfirmed and closeSource > priorSweep.price
+    float confidence = failedSweep ? clampConfidence(priorSweep.confidence + 5.0) : 0.0
+    failedSweep ? newLiquidityEvent(EVENT_FAILED_SWEEP_LOW, priorSweep.price, bar_index, confidence, priorSweep.liquidityScope) : noLiquidityEvent()
+
+// Detects high-side and low-side liquidity sweeps in one call.
+export detectLiquiditySweep(series float highSource, series float lowSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    LiquidityEvent sweepHigh = detectSweepHigh(highSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)
+    LiquidityEvent sweepLow = detectSweepLow(lowSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)
+    [sweepHigh, sweepLow]
+
+// Detects high-side and low-side liquidity grabs in one call.
+export detectLiquidityGrab(series float highSource, series float lowSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    LiquidityEvent grabHigh = detectGrabHigh(highSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)
+    LiquidityEvent grabLow = detectGrabLow(lowSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)
+    [grabHigh, grabLow]
+
+// Detects failed high-side and low-side sweeps in one call.
+export detectFailedSweep(series float highSource, series float lowSource, series float closeSource, int lookback, string toleranceMode, float toleranceValue, int atrLength, bool isExternal) =>
+    LiquidityEvent failedHigh = detectFailedSweepHigh(highSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)
+    LiquidityEvent failedLow = detectFailedSweepLow(lowSource, closeSource, lookback, toleranceMode, toleranceValue, atrLength, isExternal)
+    [failedHigh, failedLow]
